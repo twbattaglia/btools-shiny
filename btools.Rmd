@@ -1,0 +1,393 @@
+---
+title: "Btools-shiny"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    source_code: https://github.com/twbattaglia/btools-shiny
+    theme: bootstrap
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(shiny)
+library(DT)
+source("helpers.R")
+options(shiny.maxRequestSize = 15*1024^2) # 15mb limit
+```
+
+
+Data Upload
+=====================================  
+
+Inputs {.sidebar}
+-----------------------------------------------------------------------
+```{r upload}
+p("Hello World!")
+
+# OTU table
+h4('OTU Table')
+fileInput(inputId = 'uploadInputOTU', 
+          label = helpText("BIOM file must be in JSON format."),
+          accept = c('.biom'))
+tags$hr()
+
+# Map
+h4('Metadata File')
+fileInput(inputId = 'uploadInputMap', 
+          label = helpText("Must be a valid mapping file."),
+          accept = c('.txt', ".tsv"))
+tags$hr()
+
+# Tree
+h4('Tree File')
+fileInput(inputId = 'uploadInputTree', 
+          label = helpText("Tree must be in newick format."),
+          accept = c('.tre'))
+tags$hr()
+
+# Example data
+actionButton("load_example", label = 'Load Example Data', width = "225px")
+```
+
+
+```{r reactive}
+# Reactive values to store imported data
+pdata <- reactive({
+  
+  # Observe for example data
+  if(input$load_example > 0){
+    showNotification("Using example dataset...", type = "message")
+    data(GlobalPatterns)
+    taxa <- microbiome::core(GlobalPatterns, 500, 0.30)
+    phylodata <- phyloseq::prune_taxa(taxa, GlobalPatterns)
+    return(phylodata)
+  }
+  
+  # Err if null
+  if(is.null(input$uploadInputOTU) || is.null(input$uploadInputMap) || is.null(input$uploadInputTree)){
+    return(NULL)
+  }
+
+  # Show message
+  showNotification("Importing data...", type = "message")
+    
+  # Run import function once all files are uploaded
+  phylo <- create_phylo(biom_fp = input$uploadInputOTU$datapath, 
+                        tree_fp = input$uploadInputTree$datapath, 
+                        map_fp = input$uploadInputMap$datapath)
+    
+  # Remove any OTUs with 0 abundance across all samples
+  phylo <- prune_taxa(taxa_sums(phylo) > 0, phylo)
+    
+  # Return phyloseq object
+  return(phylo)
+})
+```
+
+
+
+
+Column {data-width=700} {.tabset .tabset-fade}
+-----------------------------------------------------------------------
+
+### Sample Depths
+```{r sample depths}
+# Sampling depths from input mapping file
+# - (TODO) add unique # of OTUs for each sample
+output$sampleDepthTable = DT::renderDataTable({
+    # Err if null
+    validate(
+      need(expr = !is.null(pdata()), message = "Please upload data...")
+    )
+    results <- data.frame(Depth = sample_sums(pdata()))
+    return(results)
+    },
+    server = F, 
+    extensions = 'Buttons',
+    options = list(lengthChange = TRUE, 
+                   dom = 'Bfrtip',
+                   buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                   autoWidth = F,
+                   pageLength = 15,
+                   searchHighlight = TRUE,
+                   scrollX = F)
+)
+fluidPage(DT::dataTableOutput('sampleDepthTable'))
+```
+
+### Bubbles Plot
+```{r bubbleplot}
+# Select taxonomic level
+selectInput(
+  inputId = "bubblePhylaLevel",
+  label = "", 
+  choices = list(
+    "Kingdom" = "Kingdom",
+    "Phylum" = "Phylum",
+    "Class" = "Class",
+    "Order" = "Order",
+    "Family" = "Family",
+    "Genus" = "Genus",
+    "Species" = "Species"),
+  selected = "Phylum")
+
+
+# Bubbles plot of phyla abundances across all samples
+output$bubblePhyla <- renderBubbles({
+    # Err if null
+    validate(
+      need(expr = !is.null(pdata()), message = "Please upload data...")
+    )
+    
+    message("Generating Bubbles Plot")
+    data <- transform_sample_counts(pdata(), function(OTU) OTU/sum(OTU))
+    data_rel <- tax_glom(data, taxrank = as.character(input$bubblePhylaLevel))
+    data_rel_final <- data_rel %>%
+      psmelt() %>%
+      group_by_(input$bubblePhylaLevel) %>%
+      summarise(Abundance_New = sum(Abundance))
+    
+    # Colors for bubbles
+    n = nrow(data_rel_final)
+    palette <- distinctColorPalette(n)
+    print(bubbles(value = sqrt(data_rel_final$Abundance_New), 
+                  label = data_rel_final[[1]], 
+                  key = data_rel_final[[1]],
+                  width = NULL, 
+                  tooltip = data_rel_final[[1]], 
+                  color = palette, 
+                  textColor = "black"))
+})
+fillPage(bubblesOutput("bubblePhyla"))
+```
+
+### Sample Metadata
+```{r metdata table}
+# Sample metadata from input mapping file
+output$sampleMetadataTable = DT::renderDataTable({
+      
+    # Err if null
+    validate(
+      need(expr = !is.null(pdata()), message = "Please upload data...")
+    )
+    
+    # Return table of data
+    results <- as(sample_data(pdata()), "data.frame")
+    return(results)},
+    server = T, 
+    extensions = c("FixedColumns"),
+    class = 'cell-border stripe',
+    options = list(lengthChange = TRUE, 
+                   autoWidth = TRUE,
+                   pageLength = 15,
+                   buttons = I('colvis'),
+                   fixedColumns = TRUE,
+                   searchHighlight = TRUE,
+                   scrollX = TRUE)
+)
+fillPage(DT::dataTableOutput('sampleMetadataTable'))
+```
+
+### Sampling depth histogram
+```{r slider depth}
+# Slider input for sample depth histogram
+sliderInput(
+  inputId = "sampleDepthHistoSlider",
+  label = "Bin width: ",
+  min = 10, max = 50, 
+  value = 20, step = 5, width = "100%"
+)
+tags$hr()
+```
+
+```{r sample histogram}
+output$sampleDepthHisto <- renderHighchart({
+  
+  # Err if null
+  validate(
+    need(expr = !is.null(pdata()), message = "Please upload data...")
+  )
+  
+  # Plot sample depths
+  sample_sums(pdata()) %>%
+    hchist(breaks = input$sampleDepthHistoSlider) %>%
+    hc_legend(enabled = FALSE)
+})
+fluidPage(highchartOutput("sampleDepthHisto"))
+```
+
+### OTU Rank Abundance
+```{r sliderRA}
+# Slider input for number of OTUs to show
+sliderInput(
+  inputId = "rankAbundanceHistoSlider",
+  label = "Number of OTU's: ",
+  min = 1, max = 100,
+  value = 30, step = 1, width = "100%"
+)
+tags$hr()
+```
+
+```{r RA chart}
+# OTU rank abundance across input samples
+output$rankAbundanceHisto <- renderHighchart({
+  
+  # Err if null
+  validate(
+    need(expr = !is.null(pdata()), message = "Please upload data...")
+  )
+  
+  # Rank abundance barplot
+  sort(taxa_sums(pdata()), TRUE)[1:input$rankAbundanceHistoSlider] %>%
+    data.frame(Values = unlist(.), ID = names(.)) %>%
+    hchart(., "column", x = ID, y = Values)
+})
+fluidPage(highchartOutput("rankAbundanceHisto"))
+```
+
+
+Column {data-width=300}
+-----------------------------------------------------------------------
+
+### Number of samples
+```{r valuebox sampleN}
+output$sampleN <- renderValueBox({
+  
+  # Err if NULL
+  if(is.null(pdata())){
+    return(valueBox(0, caption = "Number of samples", icon = "fa-cubes"))
+  }
+  valueBox(nsamples(pdata()), caption = "Number of samples", icon = "fa-cubes")
+})
+valueBoxOutput(outputId = "sampleN")
+```
+
+### Number of OTU's
+```{r valuebox taxaN}
+output$taxaN <- renderValueBox({
+  
+  # Err if NULL
+  if(is.null(pdata())){
+    return(valueBox(0, caption = "Number of taxa", icon = "fa-users"))
+  }
+  valueBox(ntaxa(pdata()), caption = "Number of taxa", icon = "fa-cubes")
+})
+valueBoxOutput(outputId = "taxaN")
+```
+
+### Number of samples
+```{r valuebox totalDepth}
+output$totalDepth <- renderValueBox({
+  
+  # Err if NULL
+  if(is.null(pdata())){
+    return(valueBox(0, caption = "Total sampling depth", icon = "fa-users"))
+  }
+  valueBox(sum(sample_sums(pdata())), caption = "Total sampling depth", icon = "fa-users")
+})
+valueBoxOutput(outputId = "totalDepth")
+```
+
+### Mean sampling depth
+```{r valuebox meanDepth}
+output$meanDepth <- renderValueBox({
+  
+  # Err if NULL
+  if(is.null(pdata())){
+    return(valueBox(0, caption = "Mean sampling depth", icon = "fa-users"))
+  }
+  valueBox(round(mean(sample_sums(pdata())), 0), caption = "Mean sampling depth", icon = "fa-users")
+})
+valueBoxOutput(outputId = "meanDepth")
+```
+
+### Mean sampling depth
+```{r valuebox medianDepth}
+output$medianDepth <- renderValueBox({
+  
+  # Err if NULL
+  if(is.null(pdata())){
+    return(valueBox(0, caption = "Median sampling depth", icon = "fa-users"))
+  }
+  valueBox(round(median(sample_sums(pdata())), 0), caption = "Median sampling depth", icon = "fa-users")
+})
+valueBoxOutput(outputId = "medianDepth")
+```
+
+### Range of sampling depth
+```{r valuebox rangeDepth}
+output$rangeDepth <- renderValueBox({
+  
+  # Err if NULL
+  if(is.null(pdata())){
+    return(valueBox(0, caption = "Range of sampling depth", icon = "fa-users"))
+  }
+  range <- paste0(min(sample_sums(pdata())), " - ", max(sample_sums(pdata())))
+  valueBox(range, caption = "Range of sampling depth", icon = "fa-users")
+})
+valueBoxOutput(outputId = "rangeDepth")
+```
+
+### Standard deviation of sampling depth
+
+```{r valuebox sdDepth}
+output$sdDepth <- renderValueBox({
+  
+  # Err if NULL
+  if(is.null(pdata())){
+    return(valueBox(0, caption = "Standard deviation of sampling depth", icon = "fa-users"))
+  }
+  sd <- round(sd(sample_sums(pdata())), digits = 1)
+  valueBox(sd, caption = "Standard deviation of sampling depth", icon = "fa-users")
+})
+valueBoxOutput(outputId = "sdDepth")
+```
+
+
+Debugging
+=====================================  
+
+Column {data-width=600}
+-------------------------------------
+    
+### Chart 1
+    
+```{r}
+renderPrint({ 
+  if(is.null(pdata())){return(NULL)}
+
+  c(nsamples(pdata()),
+  ntaxa(pdata()),
+  sum(sample_sums(pdata())),
+  mean(sample_sums(pdata())),
+  median(sample_sums(pdata())),
+  min(sample_sums(pdata())),
+  max(sample_sums(pdata())),
+  sd(sample_sums(pdata())))
+  
+})
+```
+
+### Chart 2
+    
+```{r}
+```
+   
+Column {data-width=400}
+-------------------------------------
+   
+### Chart 3
+
+```{r}
+```   
+ 
+### Chart 4
+    
+```{r}
+
+```
+
+
+
